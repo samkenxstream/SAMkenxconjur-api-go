@@ -2,7 +2,6 @@ package conjurapi
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
@@ -11,7 +10,7 @@ import (
 )
 
 func TempFileForTesting(prefix string, fileContents string, t *testing.T) (string, error) {
-	tmpfile, err := ioutil.TempFile(t.TempDir(), prefix)
+	tmpfile, err := os.CreateTemp(t.TempDir(), prefix)
 	if err != nil {
 		return "", err
 	}
@@ -130,16 +129,18 @@ func TestConfig_LoadFromEnv(t *testing.T) {
 		os.Setenv("CONJUR_APPLIANCE_URL", "appliance-url")
 		os.Setenv("CONJUR_AUTHN_TYPE", "ldap")
 		os.Setenv("CONJUR_SERVICE_ID", "service-id")
+		os.Setenv("CONJUR_CREDENTIAL_STORAGE", "keyring")
 
 		t.Run("Returns Config loaded with values from env", func(t *testing.T) {
 			config := &Config{}
 			config.mergeEnv()
 
 			assert.EqualValues(t, *config, Config{
-				Account:      "account",
-				ApplianceURL: "appliance-url",
-				AuthnType:    "ldap",
-				ServiceID:    "service-id",
+				Account:           "account",
+				ApplianceURL:      "appliance-url",
+				AuthnType:         "ldap",
+				ServiceID:         "service-id",
+				CredentialStorage: "keyring",
 			})
 		})
 	})
@@ -228,6 +229,27 @@ cert_file: "C:\badly\escaped\path"
 		err = config.mergeYAML(tmpFileName)
 		assert.Error(t, err)
 	})
+
+	// BEGIN COMPATIBILITY WITH PYTHON CLI
+	t.Run("Accepts conjur_url and conjur_account for backwards compatibility", func(t *testing.T) {
+		conjurrcFileContents := `
+---
+conjur_url: http://path/to/appliance
+conjur_account: some account
+`
+
+		tmpFileName, err := TempFileForTesting("TestConfigBackwardsCompatibility", conjurrcFileContents, t)
+		defer os.Remove(tmpFileName) // clean up
+		assert.NoError(t, err)
+
+		config := &Config{}
+		config.mergeYAML(tmpFileName)
+		assert.EqualValues(t, *config, Config{
+			Account:      "some account",
+			ApplianceURL: "http://path/to/appliance",
+		})
+	})
+	// END COMPATIBILITY WITH PYTHON CLI
 }
 
 var conjurrcTestCases = []struct {
@@ -248,13 +270,14 @@ appliance_url: test-appliance-url
 	{
 		name: "Full config",
 		config: Config{
-			Account:      "test-account",
-			ApplianceURL: "test-appliance-url",
-			AuthnType:    "oidc",
-			ServiceID:    "test-service-id",
-			SSLCertPath:  "test-cert-path",
-			NetRCPath:    "test-netrc-path",
-			SSLCert:      "test-cert",
+			Account:           "test-account",
+			ApplianceURL:      "test-appliance-url",
+			AuthnType:         "oidc",
+			ServiceID:         "test-service-id",
+			SSLCertPath:       "test-cert-path",
+			NetRCPath:         "test-netrc-path",
+			SSLCert:           "test-cert",
+			CredentialStorage: "keyring",
 		},
 		expected: `account: test-account
 appliance_url: test-appliance-url
@@ -262,6 +285,7 @@ netrc_path: test-netrc-path
 cert_file: test-cert-path
 authn_type: oidc
 service_id: test-service-id
+credential_storage: keyring
 `,
 	},
 }
@@ -275,4 +299,87 @@ func TestConfig_Conjurrc(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestConfig_ReadSSLCert(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Reads SSL cert from file", func(t *testing.T) {
+		tmpFileName, err := TempFileForTesting("TestConfigReadSSLCert", "test-cert", t)
+		defer os.Remove(tmpFileName) // clean up
+		assert.NoError(t, err)
+
+		config := Config{
+			SSLCertPath: tmpFileName,
+		}
+
+		cert, err := config.ReadSSLCert()
+		assert.NoError(t, err)
+		assert.Equal(t, "test-cert", string(cert))
+	})
+
+	t.Run("Returns error when SSL cert file is not found", func(t *testing.T) {
+		config := Config{
+			SSLCertPath: "not-found",
+		}
+
+		_, err := config.ReadSSLCert()
+		assert.Error(t, err)
+	})
+
+	t.Run("Returns error when SSL cert file is not set", func(t *testing.T) {
+		config := Config{}
+
+		cert, err := config.ReadSSLCert()
+		assert.EqualError(t, err, "open : no such file or directory")
+		assert.Nil(t, cert)
+	})
+
+	t.Run("Returns SSLCert when set", func(t *testing.T) {
+		config := Config{
+			SSLCert: "test-cert",
+		}
+
+		cert, err := config.ReadSSLCert()
+		assert.NoError(t, err)
+		assert.Equal(t, "test-cert", string(cert))
+	})
+}
+
+func TestConfig_BaseURL(t *testing.T) {
+	testCases := []struct {
+		name         string
+		applianceUrl string
+		sslCert      string
+		expected     string
+	}{
+		{
+			name:         "with https prefix",
+			applianceUrl: "https://conjur.myorg.com",
+			expected:     "https://conjur.myorg.com",
+		},
+		{
+			name:         "without prefix",
+			applianceUrl: "conjur.myorg.com",
+			expected:     "http://conjur.myorg.com",
+		},
+		{
+			name:         "with cert",
+			applianceUrl: "conjur.myorg.com",
+			sslCert:      "test-cert",
+			expected:     "https://conjur.myorg.com",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			config := Config{
+				ApplianceURL: testCase.applianceUrl,
+				SSLCert:      testCase.sslCert,
+			}
+
+			actual := config.BaseURL()
+			assert.Equal(t, testCase.expected, actual)
+		})
+	}
 }

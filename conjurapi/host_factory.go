@@ -32,8 +32,13 @@ func (c *Client) CreateToken(durationStr string, hostFactory string, cidrs []str
 		return nil, err
 	}
 	expiration := time.Now().Add(duration).Format(time.RFC3339)
-	data.Set("expiration", expiration)
+	account, kind, identifier, err := c.parseIDandEnforceKind(hostFactory, "host_factory")
+	if err != nil {
+		return nil, err
+	}
+	hostFactory = fmt.Sprintf("%s:%s:%s", account, kind, identifier)
 	data.Set("host_factory", hostFactory)
+	data.Set("expiration", expiration)
 	data.Set("count", fmt.Sprint(count))
 	for _, cidr := range cidrs {
 		data.Add("cidr[]", cidr)
@@ -81,7 +86,13 @@ func (c *Client) DeleteToken(token string) error {
 	return response.EmptyResponse(resp)
 }
 
-func (c *Client) CreateHost(data url.Values, token string) (HostFactoryHostResponse, error) {
+func (c *Client) CreateHost(id string, token string) (HostFactoryHostResponse, error) {
+	data := url.Values{}
+	data.Set("id", id)
+	return c.createHost(data, token)
+}
+
+func (c *Client) createHost(data url.Values, token string) (HostFactoryHostResponse, error) {
 
 	var jsonResponse HostFactoryHostResponse
 	encodedData := data.Encode()
@@ -94,13 +105,6 @@ func (c *Client) CreateHost(data url.Values, token string) (HostFactoryHostRespo
 	if err != nil {
 		return jsonResponse, err
 	}
-	respData, err := response.DataResponse(resp)
-	if err != nil {
-		return jsonResponse, err
-	}
-	err = json.Unmarshal(respData, &jsonResponse)
-	if err != nil {
-		return jsonResponse, err
-	}
-	return jsonResponse, response.EmptyResponse(resp)
+	err = response.JSONResponse(resp, &jsonResponse)
+	return jsonResponse, err
 }

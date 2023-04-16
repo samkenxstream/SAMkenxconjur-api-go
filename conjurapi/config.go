@@ -17,14 +17,14 @@ import (
 var supportedAuthnTypes = []string{"authn", "ldap", "oidc"}
 
 type Config struct {
-	Account             string `yaml:"account,omitempty"`
-	ApplianceURL        string `yaml:"appliance_url,omitempty"`
-	NetRCPath           string `yaml:"netrc_path,omitempty"`
-	SSLCert             string `yaml:"-"`
-	SSLCertPath         string `yaml:"cert_file,omitempty"`
-	AuthnType           string `yaml:"authn_type,omitempty"`
-	ServiceID           string `yaml:"service_id,omitempty"`
-	DontSaveCredentials bool   `yaml:"-"`
+	Account           string `yaml:"account,omitempty"`
+	ApplianceURL      string `yaml:"appliance_url,omitempty"`
+	NetRCPath         string `yaml:"netrc_path,omitempty"`
+	SSLCert           string `yaml:"-"`
+	SSLCertPath       string `yaml:"cert_file,omitempty"`
+	AuthnType         string `yaml:"authn_type,omitempty"`
+	ServiceID         string `yaml:"service_id,omitempty"`
+	CredentialStorage string `yaml:"credential_storage,omitempty"`
 }
 
 func (c *Config) IsHttps() bool {
@@ -90,11 +90,13 @@ func (c *Config) merge(o *Config) {
 	c.SSLCert = mergeValue(c.SSLCert, o.SSLCert)
 	c.SSLCertPath = mergeValue(c.SSLCertPath, o.SSLCertPath)
 	c.NetRCPath = mergeValue(c.NetRCPath, o.NetRCPath)
+	c.CredentialStorage = mergeValue(c.CredentialStorage, o.CredentialStorage)
 	c.AuthnType = mergeValue(c.AuthnType, o.AuthnType)
 	c.ServiceID = mergeValue(c.ServiceID, o.ServiceID)
 }
 
 func (c *Config) mergeYAML(filename string) error {
+	// Read the YAML file
 	buf, err := ioutil.ReadFile(filename)
 
 	if err != nil {
@@ -103,9 +105,15 @@ func (c *Config) mergeYAML(filename string) error {
 		return nil
 	}
 
+	// Parse the YAML file into a new struct containing the same
+	// fields as Config, plus a few extra fields for compatibility
 	aux := struct {
 		ConjurVersion string `yaml:"version"`
 		Config        `yaml:",inline"`
+		// BEGIN COMPATIBILITY WITH PYTHON CLI
+		ConjurURL     string `yaml:"conjur_url"`
+		ConjurAccount string `yaml:"conjur_account"`
+		// END COMPATIBILITY WITH PYTHON CLI
 	}{}
 
 	if err := yaml.Unmarshal(buf, &aux); err != nil {
@@ -113,21 +121,36 @@ func (c *Config) mergeYAML(filename string) error {
 		return err
 	}
 
+	// Now merge the parsed config into the current config object
 	logging.ApiLog.Debugf("Config from %s: %+v\n", filename, aux.Config)
 	c.merge(&aux.Config)
+
+	// BEGIN COMPATIBILITY WITH PYTHON CLI
+	// The Python CLI uses the keys conjur_url and conjur_account
+	// instead of appliance_url and account. Check if those keys
+	// are present and use them if the new keys are not present.
+	if c.ApplianceURL == "" && aux.ConjurURL != "" {
+		c.ApplianceURL = aux.ConjurURL
+	}
+
+	if c.Account == "" && aux.ConjurAccount != "" {
+		c.Account = aux.ConjurAccount
+	}
+	// END COMPATIBILITY WITH PYTHON CLI
 
 	return nil
 }
 
 func (c *Config) mergeEnv() {
 	env := Config{
-		ApplianceURL: os.Getenv("CONJUR_APPLIANCE_URL"),
-		SSLCert:      os.Getenv("CONJUR_SSL_CERTIFICATE"),
-		SSLCertPath:  os.Getenv("CONJUR_CERT_FILE"),
-		Account:      os.Getenv("CONJUR_ACCOUNT"),
-		NetRCPath:    os.Getenv("CONJUR_NETRC_PATH"),
-		AuthnType:    os.Getenv("CONJUR_AUTHN_TYPE"),
-		ServiceID:    os.Getenv("CONJUR_SERVICE_ID"),
+		ApplianceURL:      os.Getenv("CONJUR_APPLIANCE_URL"),
+		SSLCert:           os.Getenv("CONJUR_SSL_CERTIFICATE"),
+		SSLCertPath:       os.Getenv("CONJUR_CERT_FILE"),
+		Account:           os.Getenv("CONJUR_ACCOUNT"),
+		NetRCPath:         os.Getenv("CONJUR_NETRC_PATH"),
+		CredentialStorage: os.Getenv("CONJUR_CREDENTIAL_STORAGE"),
+		AuthnType:         os.Getenv("CONJUR_AUTHN_TYPE"),
+		ServiceID:         os.Getenv("CONJUR_SERVICE_ID"),
 	}
 
 	logging.ApiLog.Debugf("Config from environment: %+v\n", env)

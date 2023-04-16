@@ -6,15 +6,38 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+- Improved error message for failed JWT authentication
+  [cyberark/conjur-api-go#169](https://github.com/cyberark/conjur-api-go/pull/169)
+
+## [0.11.0] - 2023-02-28
+
 ### Added
 - Added support for Conjur's LDAP authenticator
   [cyberark/conjur-api-go#141](https://github.com/cyberark/conjur-api-go/pull/141)
 - Added support for Conjur's OIDC authenticator
   [cyberark/conjur-api-go#144](https://github.com/cyberark/conjur-api-go/pull/144)
+- Added `CONJUR_AUTHN_JWT_TOKEN` to support authenticating via authn-jwt with the contents of a JSON Web Token (JWT) [cyberark/conjur-api-go#143](https://github.com/cyberark/conjur-api-go/pull/140)
+- Added new API method `CheckPermissionForRole`
+  [cyberark/conjur-api-go#153](https://github.com/cyberark/conjur-api-go/pull/153)
 
 ### Removed
 - Remove all usage of Conjur v4
   [cyberark/conjur-api-go#139](https://github.com/cyberark/conjur-api-go/pull/139)
+
+### Changed
+- Resource IDs can now be partially-qualified, adhering to the form
+  `[<account>:]<kind>:<identifier>`.
+  [cyberark/conjur-api-go#153](https://github.com/cyberark/conjur-api-go/pull/153)
+- User and Host IDs passed to their respective API key rotation functions can
+  now be fully-qualified, adhering to the form `[[<account>:]<kind>:]<identifier>`.
+  [cyberark/conjur-api-go#166](https://github.com/cyberark/conjur-api-go/pull/166)
+- The Hostfactory id is no longer required to be a fully qualified id.
+  [cyberark/conjur-api-go#164](https://github.com/cyberark/conjur-api-go/pull/164)
+
+### Security
+- Upgrade gopkg.in/yaml.v3 indirect dependencies to v3.0.1 and Dockerfile to golang:1.19.5
+  [cyberark/conjur-api-go#158](https://github.com/cyberark/conjur-api-go/pull/158)
 
 ## [0.10.2] - 2022-11-14
 
@@ -140,7 +163,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Added
 - Initial version
 
-[Unreleased]: https://github.com/cyberark/conjur-api-go/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/cyberark/conjur-api-go/compare/v0.11.0...HEAD
+[0.10.3]: https://github.com/cyberark/conjur-api-go/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/cyberark/conjur-api-go/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/cyberark/conjur-api-go/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/cyberark/conjur-api-go/compare/v0.9.0...v0.10.0

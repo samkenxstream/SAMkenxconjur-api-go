@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bgentry/go-netrc/netrc"
 	"github.com/cyberark/conjur-api-go/conjurapi/authn"
 	"github.com/cyberark/conjur-api-go/conjurapi/logging"
+	"github.com/cyberark/conjur-api-go/conjurapi/response"
 )
 
 type Authenticator interface {
@@ -23,11 +23,20 @@ type Authenticator interface {
 	NeedsTokenRefresh() bool
 }
 
+type CredentialStorageProvider interface {
+	StoreCredentials(login string, password string) error
+	ReadCredentials() (login string, password string, err error)
+	ReadAuthnToken() ([]byte, error)
+	StoreAuthnToken(token []byte) error
+	PurgeCredentials() error
+}
+
 type Client struct {
 	config        Config
 	authToken     *authn.AuthnToken
 	httpClient    *http.Client
 	authenticator Authenticator
+	storage       CredentialStorageProvider
 }
 
 func NewClientFromKey(config Config, loginPair authn.LoginPair) (*Client, error) {
@@ -88,25 +97,6 @@ func LoginPairFromEnv() (*authn.LoginPair, error) {
 	}, nil
 }
 
-func LoginPairFromNetRC(config Config) (*authn.LoginPair, error) {
-	if config.NetRCPath == "" {
-		config.NetRCPath = os.ExpandEnv("$HOME/.netrc")
-	}
-
-	rc, err := netrc.ParseFile(config.NetRCPath)
-	if err != nil {
-		return nil, err
-	}
-
-	m := rc.FindMachine(getMachineName(config))
-
-	if m == nil {
-		return nil, fmt.Errorf("No credentials found in NetRCPath")
-	}
-
-	return &authn.LoginPair{Login: m.Login, APIKey: m.Password}, nil
-}
-
 // TODO: Create a version of this function for creating an authenticator from environment
 func NewClientFromEnvironment(config Config) (*Client, error) {
 	err := config.Validate()
@@ -127,7 +117,30 @@ func NewClientFromEnvironment(config Config) (*Client, error) {
 
 	authnJwtServiceID := os.Getenv("CONJUR_AUTHN_JWT_SERVICE_ID")
 	if authnJwtServiceID != "" {
+		return NewClientFromJwt(config, authnJwtServiceID)
+	}
 
+	loginPair, err := LoginPairFromEnv()
+	if err == nil && loginPair.Login != "" && loginPair.APIKey != "" {
+		return NewClientFromKey(config, *loginPair)
+	}
+
+	client, err := newClientFromStoredCredentials(config)
+	if err != nil {
+		return nil, err
+	}
+
+	if client != nil {
+		return client, nil
+	}
+	return nil, fmt.Errorf("Environment variables and machine identity files satisfying at least one authentication strategy must be present!")
+}
+
+func NewClientFromJwt(config Config, authnJwtServiceID string) (*Client, error) {
+	var jwtTokenString string
+	jwtToken := os.Getenv("CONJUR_AUTHN_JWT_TOKEN")
+	jwtTokenString = fmt.Sprintf("jwt=%s", jwtToken)
+	if jwtToken == "" {
 		jwtTokenPath := os.Getenv("JWT_TOKEN_PATH")
 		if jwtTokenPath == "" {
 			jwtTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -137,74 +150,80 @@ func NewClientFromEnvironment(config Config) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		jwtTokenString := fmt.Sprintf("jwt=%s", string(jwtToken))
+		jwtTokenString = fmt.Sprintf("jwt=%s", string(jwtToken))
+	}
 
-		var httpClient *http.Client
-		if config.IsHttps() {
-			cert, err := config.ReadSSLCert()
-			if err != nil {
-				return nil, err
-			}
-			httpClient, err = newHTTPSClient(cert)
-			if err != nil {
-				return nil, err
-			}
-
-		} else {
-			httpClient = &http.Client{Timeout: time.Second * 10}
-		}
-
-		authnJwtHostID := os.Getenv("CONJUR_AUTHN_JWT_HOST_ID")
-		authnJwtUrl := ""
-		if authnJwtHostID != "" {
-			authnJwtUrl = makeRouterURL(config.ApplianceURL, "authn-jwt", authnJwtServiceID, config.Account, url.PathEscape(authnJwtHostID), "authenticate").String()
-		} else {
-			authnJwtUrl = makeRouterURL(config.ApplianceURL, "authn-jwt", authnJwtServiceID, config.Account, "authenticate").String()
-		}
-
-		req, err := http.NewRequest("POST", authnJwtUrl, strings.NewReader(jwtTokenString))
+	var httpClient *http.Client
+	if config.IsHttps() {
+		cert, err := config.ReadSSLCert()
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		httpClient, err = newHTTPSClient(cert)
 		if err != nil {
 			return nil, err
 		}
 
-		return NewClientFromToken(config, string(body))
+	} else {
+		httpClient = &http.Client{Timeout: time.Second * 10}
 	}
 
-	loginPair, err := LoginPairFromEnv()
-	if err == nil && loginPair.Login != "" && loginPair.APIKey != "" {
-		return NewClientFromKey(config, *loginPair)
+	authnJwtHostID := os.Getenv("CONJUR_AUTHN_JWT_HOST_ID")
+	var authnJwtUrl string
+	if authnJwtHostID != "" {
+		authnJwtUrl = makeRouterURL(config.ApplianceURL, "authn-jwt", authnJwtServiceID, config.Account, url.PathEscape(authnJwtHostID), "authenticate").String()
+	} else {
+		authnJwtUrl = makeRouterURL(config.ApplianceURL, "authn-jwt", authnJwtServiceID, config.Account, "authenticate").String()
 	}
 
-	loginPair, err = LoginPairFromNetRC(config)
-	if err == nil && loginPair.Login != "" && loginPair.APIKey != "" {
-		return NewClientFromKey(config, *loginPair)
+	req, err := http.NewRequest("POST", authnJwtUrl, strings.NewReader(jwtTokenString))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
 
+	token, err := response.DataResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewClientFromToken(config, string(token))
+}
+
+func newClientFromStoredCredentials(config Config) (*Client, error) {
 	if config.AuthnType == "oidc" {
-		client, err := NewClientFromOidcCode(config, "", "", "")
+		return newClientFromStoredOidcCredentials(config)
+	}
+
+	// Attempt to load credentials from whatever storage provider is configured
+	if storageProvider, _ := createStorageProvider(config); storageProvider != nil {
+		login, password, err := storageProvider.ReadCredentials()
 		if err != nil {
 			return nil, err
 		}
-		token := readCachedAccessToken(config)
-		if token != nil && !token.ShouldRefresh() {
-			return client, nil
+		if login != "" && password != "" {
+			return NewClientFromKey(config, authn.LoginPair{Login: login, APIKey: password})
 		}
-
-		return nil, fmt.Errorf("No valid OIDC token found. Please login again.")
 	}
 
-	return nil, fmt.Errorf("Environment variables and machine identity files satisfying at least one authentication strategy must be present!")
+	return nil, fmt.Errorf("No valid credentials found. Please login again.")
+}
+
+func newClientFromStoredOidcCredentials(config Config) (*Client, error) {
+	client, err := NewClientFromOidcCode(config, "", "", "")
+	if err != nil {
+		return nil, err
+	}
+	token := client.readCachedAccessToken()
+	if token != nil && !token.ShouldRefresh() {
+		return client, nil
+	}
+	return nil, fmt.Errorf("No valid OIDC token found. Please login again.")
 }
 
 func (c *Client) GetAuthenticator() Authenticator {
@@ -290,14 +309,14 @@ func (c *Client) OidcAuthenticateRequest(code, nonce, code_verifier string) (*ht
 	return req, nil
 }
 
+// RotateAPIKeyRequest requires roleID argument to be at least partially-qualified
+// ID of from [<account>:]<kind>:<identifier>.
 func (c *Client) RotateAPIKeyRequest(roleID string) (*http.Request, error) {
-	account, _, _, err := parseID(roleID)
+	account, kind, identifier, err := c.parseID(roleID)
 	if err != nil {
 		return nil, err
 	}
-	if account != c.config.Account {
-		return nil, fmt.Errorf("Account of '%s' must match the configured account '%s'", roleID, c.config.Account)
-	}
+	roleID = fmt.Sprintf("%s:%s:%s", account, kind, identifier)
 
 	rotateURL := makeRouterURL(c.authnURL(), "api_key").withFormattedQuery("role=%s", roleID).String()
 
@@ -306,6 +325,25 @@ func (c *Client) RotateAPIKeyRequest(roleID string) (*http.Request, error) {
 		rotateURL,
 		nil,
 	)
+}
+
+func (c *Client) RotateCurrentUserAPIKeyRequest(login string, password string) (*http.Request, error) {
+	rotateUrl := makeRouterURL(c.authnURL(), "api_key")
+
+	req, err := http.NewRequest(
+		"PUT",
+		rotateUrl.String(),
+		nil,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// API key can only be rotated via basic auth, NOT using bearer token
+	req.SetBasicAuth(login, password)
+
+	return req, nil
 }
 
 func (c *Client) ChangeUserPasswordRequest(username string, password string, newPassword string) (*http.Request, error) {
@@ -327,12 +365,42 @@ func (c *Client) ChangeUserPasswordRequest(username string, password string, new
 	return req, nil
 }
 
-func (c *Client) CheckPermissionRequest(resourceID string, privilege string) (*http.Request, error) {
-	account, kind, id, err := parseID(resourceID)
+// CheckPermissionRequest crafts an HTTP request to Conjur's /resource endpoint
+// to check if the authenticated user has the given privilege on the given resourceID.
+func (c *Client) CheckPermissionRequest(resourceID, privilege string) (*http.Request, error) {
+	account, kind, id, err := c.parseID(resourceID)
 	if err != nil {
 		return nil, err
 	}
-	checkURL := makeRouterURL(c.resourcesURL(account), kind, url.QueryEscape(id)).withFormattedQuery("check=true&privilege=%s", url.QueryEscape(privilege)).String()
+
+	query := fmt.Sprintf("check=true&privilege=%s", url.QueryEscape(privilege))
+
+	checkURL := makeRouterURL(c.resourcesURL(account), kind, url.QueryEscape(id)).withQuery(query).String()
+
+	return http.NewRequest(
+		"GET",
+		checkURL,
+		nil,
+	)
+}
+
+// CheckPermissionForRoleRequest crafts an HTTP request to Conjur's /resource endpoint
+// to check if a given role has the given privilege on the given resourceID.
+func (c *Client) CheckPermissionForRoleRequest(resourceID, roleID, privilege string) (*http.Request, error) {
+	account, kind, id, err := c.parseID(resourceID)
+	if err != nil {
+		return nil, err
+	}
+
+	roleAccount, roleKind, roleIdentifier, err := c.parseID(roleID)
+	if err != nil {
+		return nil, err
+	}
+	fullyQualifiedRoleID := strings.Join([]string{roleAccount, roleKind, roleIdentifier}, ":")
+
+	query := fmt.Sprintf("check=true&privilege=%s&role=%s", url.QueryEscape(privilege), url.QueryEscape(fullyQualifiedRoleID))
+
+	checkURL := makeRouterURL(c.resourcesURL(account), kind, url.QueryEscape(id)).withQuery(query).String()
 
 	return http.NewRequest(
 		"GET",
@@ -342,7 +410,7 @@ func (c *Client) CheckPermissionRequest(resourceID string, privilege string) (*h
 }
 
 func (c *Client) ResourceRequest(resourceID string) (*http.Request, error) {
-	account, kind, id, err := parseID(resourceID)
+	account, kind, id, err := c.parseID(resourceID)
 	if err != nil {
 		return nil, err
 	}
@@ -374,6 +442,10 @@ func (c *Client) ResourcesRequest(filter *ResourceFilter) (*http.Request, error)
 		if filter.Offset != 0 {
 			query.Add("offset", strconv.Itoa(filter.Offset))
 		}
+
+		if filter.Role != "" {
+			query.Add("acting_as", filter.Role)
+		}
 	}
 
 	requestURL := makeRouterURL(c.resourcesURL(c.config.Account)).withQuery(query.Encode())
@@ -386,7 +458,7 @@ func (c *Client) ResourcesRequest(filter *ResourceFilter) (*http.Request, error)
 }
 
 func (c *Client) PermittedRolesRequest(resourceID string, privilege string) (*http.Request, error) {
-	account, kind, id, err := parseID(resourceID)
+	account, kind, id, err := c.parseID(resourceID)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +472,7 @@ func (c *Client) PermittedRolesRequest(resourceID string, privilege string) (*ht
 }
 
 func (c *Client) RoleRequest(roleID string) (*http.Request, error) {
-	account, kind, id, err := parseID(roleID)
+	account, kind, id, err := c.parseID(roleID)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +486,7 @@ func (c *Client) RoleRequest(roleID string) (*http.Request, error) {
 }
 
 func (c *Client) RoleMembersRequest(roleID string) (*http.Request, error) {
-	account, kind, id, err := parseID(roleID)
+	account, kind, id, err := c.parseID(roleID)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +500,7 @@ func (c *Client) RoleMembersRequest(roleID string) (*http.Request, error) {
 }
 
 func (c *Client) RoleMembershipsRequest(roleID string) (*http.Request, error) {
-	account, kind, id, err := parseID(roleID)
+	account, kind, id, err := c.parseID(roleID)
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +516,7 @@ func (c *Client) RoleMembershipsRequest(roleID string) (*http.Request, error) {
 func (c *Client) LoadPolicyRequest(mode PolicyMode, policyID string, policy io.Reader) (*http.Request, error) {
 	fullPolicyID := makeFullId(c.config.Account, "policy", policyID)
 
-	account, kind, id, err := parseID(fullPolicyID)
+	account, kind, id, err := c.parseID(fullPolicyID)
 	if err != nil {
 		return nil, err
 	}
@@ -591,6 +663,11 @@ func (c *Client) CreateHostRequest(body string, token string) (*http.Request, er
 	return request, nil
 }
 
+func (c *Client) PublicKeysRequest(kind string, identifier string) (*http.Request, error) {
+	publicKeysURL := makeRouterURL(c.config.ApplianceURL, "public_keys", c.config.Account, kind, identifier)
+	return http.NewRequest("GET", publicKeysURL.String(), nil)
+}
+
 func (c *Client) createTokenURL() string {
 	return makeRouterURL(c.config.ApplianceURL, "host_factory_tokens").String()
 }
@@ -600,7 +677,7 @@ func (c *Client) createHostURL() string {
 }
 
 func (c *Client) variableURL(variableID string) (string, error) {
-	account, kind, id, err := parseID(variableID)
+	account, kind, id, err := c.parseID(variableID)
 	if err != nil {
 		return "", err
 	}
@@ -608,7 +685,7 @@ func (c *Client) variableURL(variableID string) (string, error) {
 }
 
 func (c *Client) variableWithVersionURL(variableID string, version int) (string, error) {
-	account, kind, id, err := parseID(variableID)
+	account, kind, id, err := c.parseID(variableID)
 	if err != nil {
 		return "", err
 	}
@@ -667,19 +744,66 @@ func makeFullId(account, kind, id string) string {
 	return strings.Join(tokens, ":")
 }
 
-func parseID(fullID string) (account, kind, id string, err error) {
-	tokens := strings.SplitN(fullID, ":", 3)
-	if len(tokens) != 3 {
-		err = fmt.Errorf("Id '%s' must be fully qualified", fullID)
-		return
+// parseID accepts as argument a resource ID and returns its components - account,
+// resource kind, and identifier. The provided ID can either be fully- or
+// partially-qualified. If the ID is only partially-qualified, the configured
+// account will be returned.
+//
+// Examples:
+// c.parseID("dev:user:alice")  =>  "dev", "user", "alice", nil
+// c.parseID("user:alice")      =>  "dev", "user", "alice", nil
+// c.parseID("prod:user:alice") => "prod", "user", "alice", nil
+// c.parseID("malformed")       =>     "",     "",      "". error
+func (c *Client) parseID(id string) (account, kind, identifier string, err error) {
+	account, kind, identifier = c.unopinionatedParseID(id)
+	if identifier == "" || kind == "" {
+		return "", "", "", fmt.Errorf("Malformed ID '%s': must be fully- or partially-qualified, of form [<account>:]<kind>:<identifier>", id)
 	}
-	return tokens[0], tokens[1], tokens[2], nil
+	if account == "" {
+		account = c.config.Account
+	}
+	return account, kind, identifier, nil
+}
+
+// parseIDandEnforceKind accepts as argument a resource ID and a kind, and returns
+// the components - account, resource kind, and identifier - only if the provided
+// resource matches the expected kind. If the ID is only partially-qualified, the
+// configured account will be returned, and if the ID consists only of the
+// identifier, the expected kind will be returned.
+//
+// Examples:
+// c.parseID("dev:user:alice", "user")  =>  "dev", "user", "alice", nil
+// c.parseID("user:alice", "user")      =>  "dev", "user", "alice", nil
+// c.parseID("alice", "user")           =>  "dev", "user", "alice", nil
+// c.parseID("prod:user:alice", "user") => "prod", "user", "alice", nil
+// c.parseID("host:alice", "user")      =>     "",     "",      "", error
+func (c *Client) parseIDandEnforceKind(id, enforcedKind string) (account, kind, identifier string, err error) {
+	account, kind, identifier = c.unopinionatedParseID(id)
+	if (identifier == "") || (kind != "" && kind != enforcedKind) {
+		return "", "", "", fmt.Errorf("Malformed ID '%s', must represent a %s, of form [[<account>:]%s:]<identifier>", id, enforcedKind, enforcedKind)
+	}
+	if kind == "" {
+		kind = enforcedKind
+	}
+	if account == "" {
+		account = c.config.Account
+	}
+	return account, kind, identifier, nil
+}
+
+// unopinionatedParseID returns the components of the provided ID - account,
+// resource kind, and identifier - without expectation on resource kind or
+// account inclusion.
+func (c *Client) unopinionatedParseID(id string) (account, kind, identifier string) {
+	tokens := strings.SplitN(id, ":", 3)
+	for len(tokens) < 3 {
+		tokens = append([]string{""}, tokens...)
+	}
+	return tokens[0], tokens[1], tokens[2]
 }
 
 func NewClient(config Config) (*Client, error) {
-	var (
-		err error
-	)
+	var err error
 
 	err = config.Validate()
 
@@ -687,6 +811,24 @@ func NewClient(config Config) (*Client, error) {
 		return nil, err
 	}
 
+	httpClient, err := createHttpClient(config)
+	if err != nil {
+		return nil, err
+	}
+
+	storageProvider, err := createStorageProvider(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{
+		config:     config,
+		httpClient: httpClient,
+		storage:    storageProvider,
+	}, nil
+}
+
+func createHttpClient(config Config) (*http.Client, error) {
 	var httpClient *http.Client
 
 	if config.IsHttps() {
@@ -701,11 +843,7 @@ func NewClient(config Config) (*Client, error) {
 	} else {
 		httpClient = &http.Client{Timeout: time.Second * 10}
 	}
-
-	return &Client{
-		config:     config,
-		httpClient: httpClient,
-	}, nil
+	return httpClient, nil
 }
 
 func newClientWithAuthenticator(config Config, authenticator Authenticator) (*Client, error) {

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/cyberark/conjur-api-go/conjurapi/authn"
 	"github.com/stretchr/testify/assert"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -32,6 +31,34 @@ func TestClient_Token(t *testing.T) {
 			name:        "Create a token",
 			duration:    "10m",
 			hostFactory: "cucumber:host_factory:factory",
+			count:       1,
+			cidr:        []string{"0.0.0.0/0"},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+			assertHost: func(t *testing.T, size int, err error) {
+				assert.NoError(t, err)
+				assert.True(t, size > 0)
+			},
+		},
+		{
+			name:        "Create a token with a partial hostfactory id",
+			duration:    "10m",
+			hostFactory: "host_factory:factory",
+			count:       1,
+			cidr:        []string{"0.0.0.0/0"},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+			assertHost: func(t *testing.T, size int, err error) {
+				assert.NoError(t, err)
+				assert.True(t, size > 0)
+			},
+		},
+		{
+			name:        "Create a token with a partial (singular) hostfactory id",
+			duration:    "10m",
+			hostFactory: "factory",
 			count:       1,
 			cidr:        []string{"0.0.0.0/0"},
 			assert: func(t *testing.T, err error) {
@@ -111,6 +138,20 @@ func TestClient_Token(t *testing.T) {
 				return
 			},
 		},
+		{
+			name:          "Invalid hostfactory id",
+			duration:      "10m",
+			hostFactory:   "cucumber:factory",
+			count:         1,
+			cidr:          []string{"0.0.0.0/0"},
+			expectNoToken: true,
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+			assertHost: func(t *testing.T, size int, err error) {
+				return
+			},
+		},
 	}
 
 	t.Run("Host Factory", func(t *testing.T) {
@@ -145,10 +186,8 @@ func TestClient_Token(t *testing.T) {
 				continue
 			}
 			t.Run("Create Host", func(t *testing.T) {
-				data := url.Values{}
-				data.Set("id", "new-host")
-				host, err := conjur.CreateHost(data, token)
-				tc.assertHost(t, len(host.ApiKey),err)
+				host, err := conjur.CreateHost("new-host", token)
+				tc.assertHost(t, len(host.ApiKey), err)
 			})
 			t.Run("Delete Token", func(t *testing.T) {
 				err := conjur.DeleteToken(token)
